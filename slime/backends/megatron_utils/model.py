@@ -1,12 +1,13 @@
 import dataclasses
 import gc
 import math
+from contextlib import nullcontext
 from functools import partial
 
 import torch
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import finalize_model_grads
+from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -16,11 +17,17 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 import wandb
+from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .data import get_batch, set_local_storage
+from .data import get_batch
 from .loss import get_log_probs_and_entropy, loss_function
 from .models import get_model_provider_and_type
+
+if torch.version.hip:
+    from vllm.device_allocator.cumem import CuMemAllocator
+else:
+    from cumem_allocator import CuMemAllocator
 
 
 def get_optimizer_param_scheduler(args, optimizer):
@@ -67,23 +74,64 @@ def setup_model_and_optimizer(
     no_wd_decay_cond=None,
     scale_lr_cond=None,
     lr_mult=1.0,
-    checkpointing_context=None,
-    with_optimizer=True,
 ):
     """Setup model and optimizer."""
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(model_provider_func, model_type, wrap_with_ddp=with_optimizer)
+    model = get_model(model_provider_func, model_type, wrap_with_ddp=False)
 
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
-    config.timers = None
+    allocator = CuMemAllocator.get_instance() if args.colocate else None
+    with allocator.use_memory_pool(tag="model") if args.colocate else nullcontext():
+        config = get_model_config(model[0])
 
-    if with_optimizer:
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
+        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
+        kwargs["check_for_large_grads"] = args.check_for_large_grads
+        kwargs["bucket_size"] = args.ddp_bucket_size
+        kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
+        kwargs["average_in_collective"] = args.ddp_average_in_collective
+        if args.use_custom_fsdp and args.use_precision_aware_optimizer:
+            kwargs["preserve_fp32_weights"] = False
+        ddp_config = DistributedDataParallelConfig(**kwargs)
+
+        # In the custom FSDP and DDP use path, we need to initialize the bucket size.
+        # If bucket_size is not provided as an input, use sane default.
+        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
+        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
+        # latency-bound.
+        if ddp_config.bucket_size is None:
+            ddp_config.bucket_size = max(
+                40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+            )
+        # Set bucket_size to infinity if overlap_grad_reduce is False.
+        if not ddp_config.overlap_grad_reduce:
+            ddp_config.bucket_size = None
+
+        model = [
+            DDP(
+                config=config,
+                ddp_config=ddp_config,
+                module=model_chunk,
+                # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                # model chunks is overlapped with compute anyway.
+                disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+            )
+            for (model_chunk_idx, model_chunk) in enumerate(model)
+        ]
+
+        # Optimizer
+        kwargs = {}
+        for f in dataclasses.fields(OptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = OptimizerConfig(**kwargs)
+        config.timers = None
+
         optimizer = get_megatron_optimizer(
             config,
             model,
@@ -98,19 +146,7 @@ def setup_model_and_optimizer(
                 continue
             optimizer.init_state_fn(optimizer.optimizer, optimizer.config)
 
-    else:
-        optimizer, opt_param_scheduler = None, None
-
-    iteration, _ = load_checkpoint(
-        model,
-        optimizer,
-        opt_param_scheduler,
-        checkpointing_context=checkpointing_context,
-        skip_load_to_model_and_opt=False,
-    )
-
-    print(f"Loaded checkpoint at iteration {iteration}")
-    return model, optimizer, opt_param_scheduler, iteration
+    return model, optimizer, opt_param_scheduler
 
 
 def enable_forward_pre_hook(model_chunks):
@@ -126,7 +162,7 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
 
 
 @torch.no_grad()
-def forward_only(args, model, data_iterator, num_microbatches, store_prefix=""):
+def forward_only(args, model, data_iterator, num_microbatches, store_prefix="", rollout_data=None):
     """Only do the forward pass and calculate the logprob."""
 
     config = get_model_config(model[0])
@@ -213,7 +249,7 @@ def forward_only(args, model, data_iterator, num_microbatches, store_prefix=""):
                 for value, origin_index in zip(values, origin_indices):
                     origin_values[origin_index] = value
                 values = origin_values
-            set_local_storage(f"{store_prefix}{key}", values)
+            rollout_data[f"{store_prefix}{key}"] = values
 
 
 def train_one_step(args, rollout_id, step_id, data_iterator, model, optimizer, opt_param_scheduler, num_microbatches):
@@ -456,15 +492,22 @@ def save(iteration, model, optimizer, opt_param_scheduler):
         enable_forward_pre_hook(model)
 
 
-def initialize_model_and_optimizer(args, with_optimizer=True):
+def initialize_model_and_optimizer(args):
     model_provider, model_type = get_model_provider_and_type()
 
-    model, optimizer, opt_param_scheduler, iteration = setup_model_and_optimizer(
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         args,
         model_provider,
         model_type,
-        checkpointing_context={},
-        with_optimizer=with_optimizer,
     )
+    clear_memory()
+    iteration, _ = load_checkpoint(
+        model,
+        optimizer,
+        opt_param_scheduler,
+        checkpointing_context={},
+        skip_load_to_model_and_opt=False,
+    )
+    clear_memory()
 
     return model, optimizer, opt_param_scheduler, iteration

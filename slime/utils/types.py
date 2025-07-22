@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Union
+from typing import Optional, Union, Any
 
 import torch
 
@@ -17,7 +17,7 @@ class Sample:
     response: str = ""
     response_length: int = 0
     label: Optional[str] = None
-    reward: Optional[Union[float, dict[str, float]]] = None
+    reward: Optional[Union[float, dict[str, Any]]] = None
     loss_mask: Optional[list[int]] = None
 
     class Status(Enum):

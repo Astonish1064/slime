@@ -1,47 +1,22 @@
+import abc
 import os
-import socket
-import time
-from contextlib import nullcontext
-from typing import Dict
+from datetime import timedelta
 
 import ray
 import torch
 import torch.distributed as dist
 
-
-if torch.version.hip:
-    from vllm.device_allocator.cumem import CuMemAllocator
-else:
-    from cumem_allocator import CuMemAllocator
-
-
-from megatron.core import mpu
-from ray.util.placement_group import PlacementGroup
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.utils import MultiprocessingSerializer
-from transformers import AutoConfig, AutoTokenizer
-
-from slime.backends import megatron_utils
-from slime.backends.megatron_utils import update_weight_utils
 from slime.ray.ray_actor import RayActor
+<<<<<<< HEAD
 from slime.utils.distributed_utils import init_process_group
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.timer import Timer, timer
 from tracer import tracepoint_module_setup, TracePoint
 import asyncio
+=======
 
-@ray.remote(
-    num_gpus=1,
-    runtime_env={
-        "env_vars": {
-            # because sglang will always set NCCL_CUMEM_ENABLE to 0
-            # we need also set it to 0 to prevent nccl error.
-            "NCCL_CUMEM_ENABLE": "0",
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-            "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1",
-        }
-    },
-)
+>>>>>>> f3b0ec5d12e557101e545a08a1e2b5bf0be9ae98
+
 class TrainRayActor(RayActor):
     def __init__(self, world_size, rank, master_addr, master_port):
         self._world_size = world_size
@@ -71,28 +46,22 @@ class TrainRayActor(RayActor):
         for i in range(torch.cuda.device_count()):
             print(f'{torch.cuda.get_device_name(i)} ({i})')
 
-        wandb_run_id = megatron_utils.init(args)
-        self.args.wandb_run_id = wandb_run_id
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(f"cuda:{local_rank}")
 
-        # read config and tokenizer serialized to prevent concurrent writing bug.
-        for i in range(dist.get_world_size()):
-            if i == dist.get_rank():
-                self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-                self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
-            dist.barrier(group=megatron_utils.get_gloo_group())
+        dist.init_process_group(
+            backend=args.distributed_backend,
+            timeout=timedelta(minutes=args.distributed_timeout_minutes),
+        )
 
-        if self.args.model_name is None:
-            self.model_name = type(self.hf_config).__name__.lower()
-        else:
-            self.model_name = self.args.model_name
-        self.quantization_config = getattr(self.hf_config, "quantization_config", None)
-        self.vocab_size = self.tokenizer.vocab_size if self.args.vocab_size is None else self.args.vocab_size
-        megatron_utils.set_metadata("pad_token_id", self.tokenizer.pad_token_id)
+        args.rank = dist.get_rank()
+        args.world_size = dist.get_world_size()
 
-        if self.args.debug_rollout_only:
-            Timer().start("train_wait")
-            return 0
+        # set current device
+        args.local_rank = args.rank % torch.cuda.device_count()
+        torch.cuda.set_device(f"cuda:{args.local_rank}")
 
+<<<<<<< HEAD
         allocator = CuMemAllocator.get_instance() if self.args.offload else None
 
         with allocator.use_memory_pool(tag="model") if allocator else nullcontext():
@@ -155,32 +124,17 @@ class TrainRayActor(RayActor):
         assert "model" in tags
         if isinstance(tags, str):
             tags = (tags,)
+=======
+    @abc.abstractmethod
+    def sleep(self, tags):
+        raise NotImplementedError
+>>>>>>> f3b0ec5d12e557101e545a08a1e2b5bf0be9ae98
 
-        clear_memory()
-        print_memory(f"before offload model")
-        self.update_cpu_params_dict(self.weights["actor"])
-
-        allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=tags)
-
-        clear_memory()
-        print_memory(f"after offload model")
-
-    @timer
+    @abc.abstractmethod
     def wake_up(self, tags):
-        assert self.args.offload
-        clear_memory()
-        print_memory("before wake_up model")
+        raise NotImplementedError
 
-        if isinstance(tags, str):
-            tags = (tags,)
-
-        allocator = CuMemAllocator.get_instance()
-        allocator.wake_up(tags)
-
-        clear_memory()
-        print_memory("after wake_up model")
-
+<<<<<<< HEAD
     async def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
         tp= TracePoint(f"connect_rollout_engines{self.task_id}", "1")
         tp.begin()
@@ -686,3 +640,28 @@ class RayTrainGroup:
 
     async def async_offload(self):
         return await asyncio.gather(*[actor.sleep.remote(("model")) for actor in self._actor_handlers])
+=======
+    @abc.abstractmethod
+    def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def set_data_buffer(self, data_buffer):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def train(self, rollout_id, with_data_fetching=True):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def eval(self, rollout_id):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def save_model(self, iteration, with_optimizer=True):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def update_weights(self):
+        raise NotImplementedError
+>>>>>>> f3b0ec5d12e557101e545a08a1e2b5bf0be9ae98

@@ -1,6 +1,4 @@
-import os
 import random
-from datetime import timedelta
 
 import numpy as np
 import torch
@@ -51,29 +49,12 @@ def _set_random_seed(
 
 def _initialize_distributed(args, get_embedding_ranks=None, get_position_embedding_ranks=None):
     """Initialize torch.distributed and core model parallel."""
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(f"cuda:{local_rank}")
-
-    dist.init_process_group(
-        backend=args.distributed_backend,
-        timeout=timedelta(minutes=args.distributed_timeout_minutes),
-    )
-
-    args.rank = dist.get_rank()
-    args.world_size = dist.get_world_size()
-
-    # set current device
-    args.local_rank = args.rank % torch.cuda.device_count()
-    torch.cuda.set_device(f"cuda:{args.local_rank}")
-
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     mpu.initialize_model_parallel(
         args.tensor_model_parallel_size,
         args.pipeline_model_parallel_size,
         args.virtual_pipeline_model_parallel_size,
-        args.pipeline_model_parallel_split_rank,
         pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
         context_parallel_size=args.context_parallel_size,
         hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
@@ -83,8 +64,6 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
         distributed_timeout_minutes=args.distributed_timeout_minutes,
         nccl_communicator_config_path=args.nccl_communicator_config_path,
         order="tp-cp-ep-dp-pp" if not args.use_tp_pp_dp_mapping else "tp-cp-ep-pp-dp",
-        encoder_tensor_model_parallel_size=args.encoder_tensor_model_parallel_size,
-        encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         create_gloo_process_groups=args.enable_gloo_process_groups,
@@ -96,6 +75,9 @@ def init(args):
     # Pytorch distributed.
     _initialize_distributed(args)
     _init_gloo_group()
+
+    # https://github.com/NVIDIA/Megatron-LM/issues/1563
+    assert np.__version__.startswith("1."), "Megatron does not support numpy 2.x"
 
     # Random seeds for reproducibility.
     if args.rank == 0:
