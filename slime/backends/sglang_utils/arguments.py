@@ -26,6 +26,13 @@ def add_sglang_arguments(parser):
     """
     parser = add_sglang_router_arguments(parser)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+    
+    # 添加本地引擎选项
+    parser.add_argument(
+        "--use-local-sglang-engine",
+        action="store_true",
+        help="Use local SGLang engine instead of HTTP server for inference"
+    )
 
     old_add_argument = parser.add_argument
 

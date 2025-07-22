@@ -7,6 +7,7 @@ from slime.utils.arguments import parse_args
 def train(args):
     # allocate the GPUs
     pgs = create_placement_groups(args)
+    breakpoint()
 
     actor_model = create_actor_group(args, pgs["actor"])
 

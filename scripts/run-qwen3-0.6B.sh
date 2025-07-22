@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# 配置选项
+USE_LOCAL_SGLANG_ENGINE=${USE_LOCAL_SGLANG_ENGINE:-false}  # 设置为true启用本地引擎
+
 # for rerun the task
 pkill -9 sglang
 sleep 3
@@ -17,7 +20,7 @@ export PYTHONBUFFERED=16
 
 # Set CUDA device order to avoid GPU detection issues
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,3
 
 NVLINK_COUNT=$(nvidia-smi | grep -o "NVLink" | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -28,14 +31,14 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-4B.sh"
+source "${SCRIPT_DIR}/models/qwen3-0.6B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/workspace/data/slime_start/Qwen3-4B
-   #--hf-checkpoint /root/Qwen3-4B-FP8
-   --ref-load /root/workspace/data/slime_start/Qwen3-4B_torch_dist
-   --load /root/workspace/slime_start/Qwen3-4B_slime/
-   --save /root/workspace/slime_start/Qwen3-4B_slime/
+   --hf-checkpoint /root/workspace/models/HF/Qwen3-0.6B
+   #--hf-checkpoint /root/Qwen3-0.6B-FP8
+   --ref-load /root/workspace/data/slime_start/Qwen3-0.6B_torch_dist
+   --load /root/workspace/slime_start/Qwen3-0.6B_slime/
+   --save /root/workspace/slime_start/Qwen3-0.6B_slime/
    --save-interval 20
 )
 
@@ -47,20 +50,19 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type deepscaler
    --num-rollout 1000
-   --rollout-batch-size 8
+   --rollout-batch-size 2
    --n-samples-per-prompt 2
-   --rollout-max-response-len 512
+   --rollout-max-response-len 256
    --rollout-temperature 0.8
 
-   --global-batch-size 16
+   --global-batch-size 4
    --balance-data
 )
 
 EVAL_ARGS=(
-   --eval-interval 20
    --eval-prompt-data aime /root/workspace/data/slime_start/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
-   --eval-max-response-len 1024
+   --eval-max-response-len 512
    --eval-top-p 0.7
 )
 
@@ -78,7 +80,7 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 1024
+   --max-tokens-per-gpu 256
 )
 
 GRPO_ARGS=(
@@ -110,10 +112,11 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.5
-   --sglang-disable-custom-all-reduce
-   --sglang-cpu-offload-gb 4
+   --sglang-mem-fraction-static 0.4
+   # --use-local-sglang-engine  # 注释掉本地引擎选项
+   --rollout-function-path slime.rollout.sglang_example.generate_rollout  # 使用网络调用版本
 )
+
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
@@ -128,7 +131,9 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 1 --disable-usage-stats
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats
+
+sleep 5
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -136,18 +141,16 @@ RUNTIME_ENV_JSON="{
     \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"CUDA_DEVICE_ORDER\": \"PCI_BUS_ID\",
-    \"CUDA_VISIBLE_DEVICES\": \"0\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"max_split_size_mb:512\"
   }
 }"
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train.py \
+   -- python3 train_multi_tasks.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 1 \
-   --colocate \
+   --rollout-num-gpus 1 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

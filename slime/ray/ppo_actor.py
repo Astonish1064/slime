@@ -27,7 +27,8 @@ from slime.ray.ray_actor import RayActor
 from slime.utils.distributed_utils import init_process_group
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.timer import Timer, timer
-
+from tracer import tracepoint_module_setup, TracePoint
+import asyncio
 
 @ray.remote(
     num_gpus=1,
@@ -54,15 +55,21 @@ class TrainRayActor(RayActor):
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
+        # breakpoint()
         # TODO: currently this doesn't work as ray has already set torch.cuda.device_count().
         # os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
-        os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
+        tracepoint_module_setup()
 
-    def init(self, args, role, with_ref=False):
+    async def init(self, args,task_id, role, with_ref=False):
         self.args = args
         self.role = role
         self.with_ref = with_ref
+        self.task_id = task_id
+
+        print(f'{torch.cuda.device_count()}')
+        for i in range(torch.cuda.device_count()):
+            print(f'{torch.cuda.get_device_name(i)} ({i})')
 
         wandb_run_id = megatron_utils.init(args)
         self.args.wandb_run_id = wandb_run_id
@@ -143,7 +150,7 @@ class TrainRayActor(RayActor):
         torch.cuda.synchronize()
 
     @timer
-    def sleep(self, tags):
+    async def sleep(self, tags):
         assert self.args.offload
         assert "model" in tags
         if isinstance(tags, str):
@@ -174,7 +181,9 @@ class TrainRayActor(RayActor):
         clear_memory()
         print_memory("after wake_up model")
 
-    def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
+    async def connect_rollout_engines(self, rollout_engines, rollout_engine_lock):
+        tp= TracePoint(f"connect_rollout_engines{self.task_id}", "1")
+        tp.begin()
         self.rollout_engines = rollout_engines
         self.rollout_engine_lock = rollout_engine_lock
 
@@ -219,7 +228,6 @@ class TrainRayActor(RayActor):
                     sock.bind(("", 0))
                     master_port = sock.getsockname()[1]
                 world_size = self.args.rollout_num_gpus + 1
-
                 refs = [
                     engine.init_process_group.remote(
                         master_address,
@@ -238,17 +246,17 @@ class TrainRayActor(RayActor):
                     rank=0,
                     group_name=self._group_name,
                 )
-                ray.get(refs)
-
+                await asyncio.gather(*refs)
+        tp.end()
         dist.barrier(group=megatron_utils.get_gloo_group())
 
-    def set_data_buffer(self, data_buffer):
+    async def set_data_buffer(self, data_buffer):
         self.data_buffer = data_buffer
         if getattr(self.args, "use_wandb", False) and getattr(self.args, "wandb_run_id", None):
             print(f"Updating buffer's wandb run_id to: {self.args.wandb_run_id}")
-            ray.get(self.data_buffer.update_wandb_run_id.remote(self.args.wandb_run_id))
+            await self.data_buffer.update_wandb_run_id(self.args.wandb_run_id)
 
-    def get_rollout_data(self, rollout_id):
+    async def get_rollout_data(self, rollout_id):
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will recieve the data.
         megatron_utils.process_rollout_data(rollout_id, self.args, self.data_buffer)
@@ -275,7 +283,7 @@ class TrainRayActor(RayActor):
                 store_prefix=store_prefix,
             )
 
-    def train(self, rollout_id, with_data_fetching=True):
+    async def train(self, rollout_id, with_data_fetching=True):
         Timer().end("train_wait")
 
         if self.args.debug_rollout_only:
@@ -347,14 +355,14 @@ class TrainRayActor(RayActor):
         megatron_utils.data.clear_local_storage()
         Timer().start("train_wait")
 
-    def eval(self, rollout_id):
+    async def eval(self, rollout_id):
         if self.args.debug_train_only:
             return
 
         # TODO: is logging enough?
         megatron_utils.log_eval_data(rollout_id, self.args, self.data_buffer)
 
-    def save_model(self, iteration, with_optimizer=True):
+    async def save_model(self, iteration, with_optimizer=True):
         if self.args.debug_rollout_only:
             return
 
@@ -363,10 +371,10 @@ class TrainRayActor(RayActor):
         else:
             megatron_utils.save(iteration, self.model, None, None)
 
-    def update_weights_from_distributed(self):
+    async def update_weights_from_distributed(self):
         if dist.get_rank() == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.reset_prefix_cache.remote() for engine in self.rollout_engines])
+            await asyncio.gather(*[engine.pause_generation.remote() for engine in self.rollout_engines])
+            await asyncio.gather(*[engine.reset_prefix_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=megatron_utils.get_gloo_group())
 
         buffer_size = 0
@@ -414,7 +422,7 @@ class TrainRayActor(RayActor):
 
         dist.barrier(group=megatron_utils.get_gloo_group())
         if dist.get_rank() == 0:
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            await asyncio.gather(*[engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=megatron_utils.get_gloo_group())
 
     def _update_param_from_distributed(self, converted_named_tensors):
@@ -442,12 +450,12 @@ class TrainRayActor(RayActor):
         converted_named_tensors.clear()
         ray.get(self.rollout_engine_lock.release.remote())
 
-    def update_weights_from_tensor(self):
+    async def update_weights_from_tensor(self):
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         ep_size = mpu.get_expert_model_parallel_world_size()
         rank = dist.get_rank()
         if rank == 0:
-            ray.get([engine.reset_prefix_cache.remote() for engine in self.rollout_engines])
+            await asyncio.gather(*[engine.reset_prefix_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=megatron_utils.get_gloo_group())
         for param_infos in self.param_info_buckets:
             # init params:
@@ -528,15 +536,15 @@ class TrainRayActor(RayActor):
         torch.cuda.empty_cache()
 
     @timer
-    def update_weights(self):
+    async def update_weights(self):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
         torch.cuda.empty_cache()
         if not self.args.colocate:
-            self.update_weights_from_distributed()
+            await self.update_weights_from_distributed()
         else:
-            self.update_weights_from_tensor()
+            await self.update_weights_from_tensor()
 
         dist.barrier(group=megatron_utils.get_gloo_group())
         clear_memory()
@@ -582,6 +590,7 @@ class RayTrainGroup:
 
     def __init__(
         self,
+        task_id,
         num_nodes,
         num_gpus_per_node,
         pg: tuple[PlacementGroup, list[int]],
@@ -591,6 +600,7 @@ class RayTrainGroup:
     ) -> None:
         self._num_nodes = num_nodes
         self._num_gpus_per_node = num_gpus_per_node
+        self.task_id = task_id
 
         # custom resources, see https://docs.ray.io/en/latest/ray-core/scheduling/resources.html
         self._resources = resources
@@ -601,10 +611,16 @@ class RayTrainGroup:
 
     def _allocate_gpus_for_actor(self, pg, num_gpus_per_actor):
         world_size = self._num_nodes * self._num_gpus_per_node
+        print(f'{torch.cuda.device_count()}')
+        for i in range(torch.cuda.device_count()):
+            print(f'{torch.cuda.get_device_name(i)} ({i})')
 
         # Use placement group to lock resources for models of same type
         assert pg is not None
         pg, reordered_bundle_indices = pg
+        print("8"*100)
+        print(reordered_bundle_indices)
+        print("8"*100)
         # Create worker actors
         self._actor_handlers = []
         master_addr, master_port = None, None
@@ -622,49 +638,51 @@ class RayTrainGroup:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
             self._actor_handlers.append(actor)
 
-    def async_init(self, args, role, with_ref=False):
+    async def async_init(self, args, role, with_ref=False):
         """
         Allocate GPU resourced and initialize model, optimzier, local ckpt, etc.
         """
         self.args = args
-        return [actor.init.remote(args, role, with_ref=with_ref) for actor in self._actor_handlers]
+        return await asyncio.gather(*[actor.init.remote(args,task_id=self.task_id, role=role, with_ref=with_ref) for actor in self._actor_handlers])
 
-    def async_init_weight_update_connections(self, rollout):
+    async def async_init_weight_update_connections(self, rollout):
         """
         Connect rollout engines and actors, e.g. initialize the process group between them
         to update weights after each training stage.
         """
         self.rollout = rollout
-        ray.get([actor.set_data_buffer.remote(rollout.data_buffer) for actor in self._actor_handlers])
-
-        return [
+        tp= TracePoint(f"set_data_buffer{self.task_id}", "1")
+        tp.begin()
+        await asyncio.gather(*[actor.set_data_buffer.remote(rollout.data_buffer) for actor in self._actor_handlers])
+        tp.end()
+        return await asyncio.gather(*[
             actor.connect_rollout_engines.remote(
                 rollout.rollout_engines,
                 rollout.rollout_engine_lock,
             )
             for actor in self._actor_handlers
-        ]
+        ])
 
-    def get_rollout_data(self, rollout_id):
-        ray.get([actor.get_rollout_data.remote(rollout_id) for actor in self._actor_handlers])
+    async def get_rollout_data(self, rollout_id):
+        await asyncio.gather(*[actor.get_rollout_data.remote(rollout_id) for actor in self._actor_handlers])
 
-    def async_train(self, rollout_id, with_data_fetching=True):
+    async def async_train(self, rollout_id, with_data_fetching=True):
         """Do one rollout training"""
-        return [
-            actor.train.remote(rollout_id, with_data_fetching=with_data_fetching) for actor in self._actor_handlers
-        ]
+        return await asyncio.gather(*[
+             actor.train.remote(rollout_id, with_data_fetching=with_data_fetching) for actor in self._actor_handlers
+        ])
 
-    def async_eval(self, rollout_id):
+    async def async_eval(self, rollout_id):
         """Evaluate the model"""
-        return [actor.eval.remote(rollout_id) for actor in self._actor_handlers]
+        return await asyncio.gather(*[actor.eval.remote(rollout_id) for actor in self._actor_handlers])
 
-    def async_save_model(self, step_id):
+    async def async_save_model(self, step_id):
         """Save actor model on rank 0."""
-        return [actor.save_model.remote(step_id) for actor in self._actor_handlers]
+        return await asyncio.gather(*[actor.save_model.remote(step_id) for actor in self._actor_handlers])
 
-    def async_update_weights(self):
+    async def async_update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
-        return [actor.update_weights.remote() for actor in self._actor_handlers]
+        return await asyncio.gather(*[actor.update_weights.remote() for actor in self._actor_handlers])
 
-    def async_offload(self):
-        return [actor.sleep.remote(("model")) for actor in self._actor_handlers]
+    async def async_offload(self):
+        return await asyncio.gather(*[actor.sleep.remote(("model")) for actor in self._actor_handlers])

@@ -53,6 +53,8 @@ def _create_placement_group(num_gpus):
             ).remote()
         )
     gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+    print("gpu_ids:", gpu_ids)
+
     for actor in info_actors:
         ray.kill(actor)
 
@@ -64,7 +66,6 @@ def _create_placement_group(num_gpus):
             f"  bundle {i:4}, actual_bundle_index: {actual_bundle_index:4}, "
             f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
         )
-
     return pg, pg_reordered_bundle_indices
 
 
@@ -89,30 +90,32 @@ def create_placement_groups(args):
     pg, actor_pg_reordered_bundle_indices = _create_placement_group(num_gpus)
 
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
-
+    print(f"Actor placement group: {actor_pg_reordered_bundle_indices},{ray.get_gpu_ids()}")
+    print(f"Rollout placement group: {rollout_pg_reordered_bundle_indices},{ray.get_gpu_ids()}")
     return {
         "actor": (pg, actor_pg_reordered_bundle_indices),
         "rollout": (pg, rollout_pg_reordered_bundle_indices),
     }
 
 
-def allocate_train_group(num_nodes, num_gpus_per_node, pg):
+def allocate_train_group(num_nodes, num_gpus_per_node, pg, task_id):
     return RayTrainGroup(
         num_nodes=num_nodes,
         num_gpus_per_node=num_gpus_per_node,
         pg=pg,
-        num_gpus_per_actor=0.8,
+        num_gpus_per_actor=0.5,
+        task_id=task_id
     )
 
 
-def create_actor_group(args, pg):
+async def create_actor_group(args, pg, task_id):
     actor_model = allocate_train_group(
         num_nodes=args.actor_num_nodes,
         num_gpus_per_node=args.actor_num_gpus_per_node,
         pg=pg,
+        task_id=task_id
     )
     return actor_model
 
-
-def create_rollout_group(args, pg):
-    return RolloutGroup(args, pg)
+async def create_rollout_group(args, pg, task_id, use_local_engine=False):
+    return RolloutGroup(args, task_id, pg, use_local_engine)

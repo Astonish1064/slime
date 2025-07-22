@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from sglang.srt.server_args import ServerArgs
 from slime.utils.http_utils import get_host_info
 from .http_server_engine import HttpServerEngineAdapter
+from .local_engine import SglangLocalEngine
 
 if TYPE_CHECKING:
     pass
@@ -23,8 +24,9 @@ def get_base_gpu_id(args, rank):
 
 class SglangEngine:
 
-    def __init__(self, args, rank, dist_init_addr, port, nccl_port):
+    def __init__(self, args, rank, dist_init_addr, port, nccl_port, use_local_engine=False):
         self.args = args
+        self.use_local_engine = use_local_engine
 
         # remove the CUDA_VISIBLE_DEVICES set by ray and use base_gpu_id
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -67,11 +69,17 @@ class SglangEngine:
             for key in unused_keys:
                 kwargs.pop(key)
 
-        self.llm = HttpServerEngineAdapter(
-            router_ip=args.sglang_router_ip, router_port=args.sglang_router_port, **kwargs
-        )
+        # 根据配置选择使用本地引擎还是HTTP服务器引擎
+        if self.use_local_engine:
+            print(f"Using SGLang local engine for rank {rank}")
+            self.llm = SglangLocalEngine(args, rank, dist_init_addr, port, nccl_port)
+        else:
+            print(f"Using SGLang HTTP server engine for rank {rank}")
+            self.llm = HttpServerEngineAdapter(
+                router_ip=args.sglang_router_ip, router_port=args.sglang_router_port, **kwargs
+            )
 
-    def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
+    async def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
         return self.llm.init_weights_update_group(
             master_address, master_port, rank_offset, world_size, group_name, backend
         )
@@ -84,19 +92,19 @@ class SglangEngine:
         self.llm.update_weights_from_tensor(ipc_handles)
         return
 
-    def reset_prefix_cache(self):
+    async def reset_prefix_cache(self):
         self.llm.flush_cache()
 
-    def sleep(self, level=1):
+    async def sleep(self, level=1):
         # Adhoc solution to ensure no running requests
         self.llm.flush_cache()
         self.llm.release_memory_occupation()
 
-    def wake_up(self):
+    async def wake_up(self):
         self.llm.resume_memory_occupation()
 
-    def pause_generation(self):
+    async def pause_generation(self):
         self.llm.pause_generation()
 
-    def continue_generation(self):
+    async def continue_generation(self):
         self.llm.continue_generation()

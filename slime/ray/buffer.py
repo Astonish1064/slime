@@ -13,6 +13,8 @@ from slime.utils.data import Dataset
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
+from tracer import tracepoint_module_setup, TracePoint
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -26,8 +28,12 @@ def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) ->
 
 @ray.remote
 class Buffer:
-    def __init__(self, args):
+    def __init__(self, args,use_local_engine=False):
+        tracepoint_module_setup()
+        tp=TracePoint("Buffer_init", "1")
+        tp.begin()
         self.args = args
+        self.use_local_engine = use_local_engine
 
         # a list of sample group.
         # each group has n_samples_per_prompt samples, all of them has the same prompt.
@@ -62,16 +68,21 @@ class Buffer:
         else:
             self.dataset = None
 
+        if use_local_engine:
+            self.args.rollout_function_path = "slime.rollout.sglang_example_local.generate_rollout"
+        else:
+            self.args.rollout_function_path = "slime.rollout.sglang_example.generate_rollout"
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
         print(f"import {self.args.rollout_function_path} as generate_rollout function.")
         print(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
+        tp.end()
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
         return len(self.dataset) // self.args.rollout_batch_size
 
-    def update_wandb_run_id(self, run_id):
+    async def update_wandb_run_id(self, run_id):
         """Update wandb run_id and initialize wandb"""
         self.args.wandb_run_id = run_id
         self._init_wandb()  # Now initialize wandb with the correct run_id
@@ -175,7 +186,7 @@ class Buffer:
             group = samples[i : i + self.args.n_samples_per_prompt]
             self.buffer.append(group)
 
-    def generate(self, rollout_id, evaluation=False):
+    async def generate(self, rollout_id, evaluation=False):
         self.rollout_id = rollout_id
         if self.args.debug_train_only and evaluation:
             # if debug train only, we don't generate evaluation data
@@ -260,7 +271,7 @@ class Buffer:
     def get_buffer_length(self):
         return len(self.buffer)
 
-    def save(self, rollout_id):
+    async def save(self, rollout_id):
         if not self.args.rollout_global_dataset:
             return
 
